@@ -76,5 +76,10 @@ Serial connection to ESP32
 
 Hardware:
 - LEDs suck a lot of current, so we need a power supply capable of providing high current.
+- Gamma correction
+- Visualizing 0-1 values as colors
+    - Could just choose constant colour and set brightness
+    - The LEDs I got are not very good at dim colours (strength set by PWM)
+- Took inspiration from matplotlib colourmaps - inferno is really cool
 
 I connected ESP32 to the data pin of a WS2812B LED strip via a 220 ohm resistor.
