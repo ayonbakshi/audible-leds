@@ -72,9 +72,14 @@ UDP over home network
 - UDP is great. Low latency, and packets being sent out of order/being dropped didn't really cause any significant decline in visual fidelity. We could also send time information with packets and drop packets that are sent out of order. I didn't test latecny here since I was so excited when it looked so good visually.
 
 Serial connection to ESP32
-- We can also communicate to the ESP32 via a serial connection. My esp32 board supports a baud rate of 460800b/s, or ~461kB/s. Which is more than enough. I didn't do a latency measurement experiement, but anecdotally it was < 3ms.
+- We can also communicate to the ESP32 via a serial connection. My esp32 board supports a baud rate of 460800b/s, or ~58kB/s, which is enough. I didn't do a latency measurement experiement, but anecdotally it was < 3ms.
 
 Hardware:
 - LEDs suck a lot of current, so we need a power supply capable of providing high current.
+- Gamma correction
+- Visualizing 0-1 values as colors
+    - Could just choose constant colour and set brightness
+    - The LEDs I got are not very good at dim colours (strength set by PWM)
+- Took inspiration from matplotlib colourmaps - inferno is really cool
 
 I connected ESP32 to the data pin of a WS2812B LED strip via a 220 ohm resistor.
