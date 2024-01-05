@@ -5,10 +5,6 @@ import time
 from contextlib import contextmanager
 from multiprocessing import Lock, Manager, Process
 
-import os
-
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-
 import librosa
 import matplotlib
 import numpy as np
@@ -16,6 +12,8 @@ import pyaudio
 from matplotlib import pyplot as plt
 from matplotlib.widgets import Button, Slider
 from functools import cache
+
+from scipy import sparse
 # from spleeter.separator import Separator
 
 matplotlib.use("TkAgg")
@@ -139,8 +137,8 @@ class InteractivePlot:
 
         if self.line is None:
             if self.plot_type == "line":
-                # (self.line,) = self.ax.plot(X, Y)
-                self.line = self.ax.bar(x=X, height=Y, width=1)
+                (self.line,) = self.ax.plot(X, Y)
+                # self.line = self.ax.bar(x=X, height=Y, width=1)
             elif self.plot_type == "scatter":
                 self.line = self.ax.scatter(X, Y)
             elif self.plot_type == "scatter2":
@@ -148,10 +146,10 @@ class InteractivePlot:
                 self.line = self.ax.scatter(X, _Y, s=3)
 
         if self.plot_type == "line":
-            for rect, h in zip(self.line, Y):
-                rect.set_height(h)
-            # self.line.set_xdata(X)
-            # self.line.set_ydata(Y)
+            # for rect, h in zip(self.line, Y):
+            #     rect.set_height(h)
+            self.line.set_xdata(X)
+            self.line.set_ydata(Y)
         elif self.plot_type == "scatter":
             self.line.set_offsets(np.stack([X, Y], axis=-1))
         elif self.plot_type == "scatter2":
@@ -222,44 +220,44 @@ def create_spectrum(data, sampling_freq):
 
 
 @cache
-def mel_transform_and_freqs(n_fft, fmin, fmax, sampling_freq, bands):
-    mel_filterbank = librosa.filters.mel(
-        sr=sampling_freq, n_fft=n_fft, n_mels=bands, fmin=fmin, fmax=fmax
+def mel_transform_and_freqs(n_fft, fmin, fmax, sampling_freq, bands, htk):
+    mel_basis = librosa.filters.mel(
+        sr=sampling_freq, n_fft=n_fft, n_mels=bands, fmin=fmin, fmax=fmax, htk=htk,
     )
+    mel_basis = sparse.csr_matrix(mel_basis)
 
-    mel_frequencies = librosa.mel_frequencies(n_mels=bands, fmin=fmin, fmax=fmax)
+    mel_frequencies = librosa.mel_frequencies(n_mels=bands, fmin=fmin, fmax=fmax, htk=htk)
 
-    return mel_filterbank, mel_frequencies
+    return mel_basis, mel_frequencies
 
 
-def mel_filterbank(dft, sampling_freq, bands=128):
+def mel_filterbank(dft, sampling_freq, bands, htk):
     n_fft = (len(dft) - 1) * 2  # since we only looked at positive values
     fmin = 0
     fmax = sampling_freq / 2
 
-    mel_filterbank, mel_frequencies = mel_transform_and_freqs(
-        n_fft=n_fft, fmin=fmin, fmax=fmax, sampling_freq=sampling_freq, bands=bands
+    mel_basis, mel_frequencies = mel_transform_and_freqs(
+        n_fft=n_fft, fmin=fmin, fmax=fmax, sampling_freq=sampling_freq, bands=bands, htk=htk,
     )
 
-    s = time.time()
-    mel_spectrum = np.dot(mel_filterbank, dft)
+    mel_spectrum = mel_basis.dot(dft)
 
     return mel_spectrum, mel_frequencies
 
 
 @cache
-def compute_mel_bands(bins, desired_fmax, fmax):
+def compute_mel_bands(bins, desired_fmax, fmax, htk):
     assert fmax > desired_fmax
 
-    mel_desired_fmax, mel_fmax = librosa.hz_to_mel([desired_fmax, fmax])
+    mel_desired_fmax, mel_fmax = librosa.hz_to_mel([desired_fmax, fmax], htk=htk)
     ratio = mel_desired_fmax / mel_fmax
 
     return math.ceil(bins / ratio)
 
 
-def bin_with_mel(num_bins, desired_fmax, dft, sampling_freq):
-    mel_bands = compute_mel_bands(num_bins, desired_fmax, sampling_freq / 2)
-    mel_spectrum, freqs = mel_filterbank(dft, sampling_freq, bands=mel_bands)
+def bin_with_mel(num_bins, desired_fmax, dft, sampling_freq, htk=True):
+    mel_bands = compute_mel_bands(num_bins, desired_fmax, sampling_freq / 2, htk)
+    mel_spectrum, freqs = mel_filterbank(dft, sampling_freq, bands=mel_bands, htk=htk)
 
     bins, freqs = mel_spectrum[:num_bins], freqs[:num_bins]
 
@@ -342,7 +340,7 @@ def mirror_bins(bins, reduce=True):
 def sigmoid(arr):
     return 1 / (1 + np.exp(-arr))
 
-def bass_jump(bins, jump_strength=2):
+def bass_jump(bins, jump_strength=1.2):
     hann = 0.5 + np.hanning(len(bins)) / 2
     bins = bins * hann
 
@@ -351,12 +349,31 @@ def bass_jump(bins, jump_strength=2):
 
     return bins
 
-def dynamic_range(bins, max_inv_scale=1/3):
-    inv_scale = max(max_inv_scale, np.max(bins))
-    return bins / inv_scale
+def roundup(num, precision):
+    return int(math.ceil(num / precision)) * precision
+
+class FrequencyDecay:
+    def __init__(self, min_fmax, max_fmax, step_size=50, baseline=0.99, baseline_adj_s=5):
+        self.ema = TimeBasedEMA.decay_in_n_secs(total_decay=baseline, secs=baseline_adj_s)
+        self.ema.data = 0
+
+        self.min_fmax = min_fmax
+        self.max_fmax = max_fmax
+        self.step_size = step_size
+
+    def update(self, freq):
+        self.ema.update(0)
+        freq = np.clip(freq, self.min_fmax, self.max_fmax) - self.min_fmax
+        self.ema.data = np.maximum(self.ema.data, freq)
+        return self.get_frequency()
+
+    def get_frequency(self):
+        return roundup(round(self.min_fmax + self.ema.data), self.step_size)
+
+
 
 class DynamicSensitivity:
-    def __init__(self, min_sensitivity=0.15, baseline=0.99, baseline_adj_s=5):
+    def __init__(self, num_bins, min_sensitivity=0.15, baseline=0.99, baseline_adj_s=5):
         self.ema = TimeBasedEMA.decay_in_n_secs(total_decay=baseline, secs=baseline_adj_s)
         self.ema.data = 0
 
@@ -399,44 +416,45 @@ def audio_spectrum():
             if audio_stream.stream.is_active():
                 audio_stream.stream.stop_stream()
 
-    # plot = InteractivePlot(plot_type="scatter2")
+    plot = InteractivePlot(plot_type="line")
     # plot = InteractiveDoublePlot()
-    # plot.show()
+    plot.show()
 
     print("Recording...")
 
-    num_bins = 50
-    fmax = 1250
+    num_bins = 100
 
-    window_size = 1024*8
+    window_size = 1024*4
     decay_s = 0.5
     smooth_window = 20
 
     iterations = 0
 
     ema = TimeBasedEMA.decay_in_n_secs(total_decay=0.99, secs=decay_s)
-    sens = DynamicSensitivity()
+    sens = DynamicSensitivity(num_bins)
+    freq = FrequencyDecay(1100, 4000)
     # separator = Separator('spleeter:2stems')
 
-    s = time.time()
+    m = 0
     for data in trailing_window(window_size):
         with timer() as t:
             data = normalize(data)
 
-            channel_bins = []
+            channel_spectra = []
+            max_freq = 0
             for channel in data:
                 data = preprocess_data(channel, hann_tail=1)
                 spectrum, freqs = create_spectrum(data, sampling_freq=audio_stream.rate)
+                channel_spectra.append(spectrum)
+
+                max_freq = max(max_freq, freqs[np.argmax(spectrum)])
+
+            fmax = freq.update(max_freq)
+
+            channel_bins = []
+            for spectrum in channel_spectra:
                 bins, freqs = bin_with_mel(num_bins, fmax, spectrum, audio_stream.rate)
                 channel_bins.append(bins)
-
-            # POWER
-            # data = np.average(data, axis=0)
-            # rms = librosa.feature.rms(y=data)
-            # avg_rms = rms.mean() * 4
-            # filled_bins = round(avg_rms * num_bins) 
-            # bins = np.array([0] * (num_bins - filled_bins) + [0.5] * filled_bins)
-            # channel_bins.append(bins)
 
             if len(channel_bins) == 1:
                 bins = mirror_bins(bins, reduce=False)
@@ -450,32 +468,41 @@ def audio_spectrum():
             bins = bass_jump(bins)
 
             bins = (sigmoid(bins / window_size * 1500) - 0.5) * 2
-
             bins = bins / sens.update(bins)
 
-            # s=time.time()
-            # pred = separator.separate(data.transpose())
-            # print(f"splitting took {time.time()-s}s")
-
-            
-
-        # with timer() as t_plot:
-        #     plot.update(Y=bins)
+        with timer() as t_plot:
+            plot.update(Y=bins)
         #     # plot.update(data[0], data[1])
         #     # plot.update(pred['accompaniment'].sum(axis=1)/2, pred['vocals'].sum(axis=1)/2)
-        #     pass
+            pass
         
         yield bins
 
         # iterations += 1
         # # print(f"Processed {window_size*iterations} samples ({window_size*iterations/(time.time()-s)}/s)")
 
-        # t_total = t.t + t_plot.t
-        # print(f"{t_total=}, fps {1/t_total}, analysis latency {t.t} fps {1/t.t}")
+        t_total = t.t + t_plot.t
+        print(f"{t_total=}, fps {1/t_total}, analysis latency {t.t} fps {1/t.t}")
+
+from line_profiler import LineProfiler
+
+def profile():
+    profiler = LineProfiler()
+    profiler.add_function(mel_filterbank)
+
+    gen = audio_spectrum()
+    
+    profiler.enable()
+    for i, item in enumerate(gen):
+        if i == 100:
+            break
+    profiler.disable()
+
+    profiler.print_stats()
 
 def main():
-    for bins in audio_spectrum():
-        print(max(bins))
+    for _ in audio_spectrum():
+        pass
 
 if __name__ == "__main__":
     main()

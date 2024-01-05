@@ -1,3 +1,6 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import serial
 import time
 import socket
